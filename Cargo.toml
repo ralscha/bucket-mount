@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "bucket-mount"
 version = "1.0.0"
 edition = "2024"
@@ -19,7 +19,7 @@ serde_json = "1"
 rusqlite = { version = "0.38", features = ["bundled"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "fs", "io-util", "signal"] }
-toml = "0.9"
+toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
