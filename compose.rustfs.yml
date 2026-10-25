@@ -1,0 +1,26 @@
+name: bucket-mount-rustfs
+
+services:
+  rustfs:
+    # RustFS 1.0.3. Override only when deliberately testing a different release.
+    image: ${BUCKET_MOUNT_RUSTFS_IMAGE:-rustfs/rustfs@sha256:9ca9559533b537d10482fe923288b676ad08f92a7069d9a17327fbae3cab688b}
+    command: ["/data"]
+    ports:
+      - "127.0.0.1:19000:9000"
+      - "127.0.0.1:19001:9001"
+    environment:
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?Run scripts/test-rustfs.ps1 to generate local credentials}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?Run scripts/test-rustfs.ps1 to generate local credentials}
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_OBS_LOGGER_LEVEL: "error"
+      RUSTFS_OBS_LOG_DIRECTORY: "/var/log/rustfs/"
+    volumes:
+      - data:/data
+      - logs:/var/log/rustfs
+    restart: "no"
+
+volumes:
+  data:
+  logs:

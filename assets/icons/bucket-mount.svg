@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 64 64">
+  <title>Bucket Mount</title>
+  <desc>A teal bucket with a clockwise white sync arrow forming its rim, on a navy rounded square.</desc>
+  <defs>
+    <linearGradient id="background" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#263D56"/>
+      <stop offset="100%" stop-color="#0B1425"/>
+    </linearGradient>
+    <linearGradient id="bucket" x1="0%" y1="0%" x2="70%" y2="100%">
+      <stop offset="0%" stop-color="#70F0DF"/>
+      <stop offset="100%" stop-color="#10B8BB"/>
+    </linearGradient>
+  </defs>
+  <path d="M16 2 H48 C55.732 2 62 8.268 62 16 V48 C62 55.732 55.732 62 48 62 H16 C8.268 62 2 55.732 2 48 V16 C2 8.268 8.268 2 16 2 Z" fill="url(#background)"/>
+  <path d="M16 2.5 H48 C55.456 2.5 61.5 8.544 61.5 16 V48 C61.5 55.456 55.456 61.5 48 61.5 H16 C8.544 61.5 2.5 55.456 2.5 48 V16 C2.5 8.544 8.544 2.5 16 2.5 Z" fill="none" stroke="#FFFFFF" stroke-width="1" opacity="0.1"/>
+  <path d="M17.5 29 H46.5 L42.2 47.4 C41.7 49.5 40 51 37.8 51 H26.2 C24 51 22.3 49.5 21.8 47.4 Z" fill="url(#bucket)"/>
+  <path d="M19 29.5 C22 32 26.5 33.3 32 33.3 C35.4 33.3 38.5 32.8 41 31.8" fill="none" stroke="#087F89" stroke-width="2" stroke-linecap="round" opacity="0.65"/>
+  <path d="M25 39 L26.5 45.5 C26.7 46.3 27.2 46.8 28 46.8" fill="none" stroke="#C6FFF5" stroke-width="2" stroke-linecap="round" opacity="0.55"/>
+  <path d="M17 25.5 C17 20.2 23.7 16 32 16 C40.3 16 47 20.2 47 25.5" fill="none" stroke="#F4FFFD" stroke-width="4" stroke-linecap="round"/>
+  <path d="M40.9 24.2 L47 31 L52.5 24.2 Z" fill="#F4FFFD"/>
+</svg>
