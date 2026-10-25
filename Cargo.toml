@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "bucket-mount"
 version = "1.0.0"
 edition = "2024"
@@ -16,7 +16,7 @@ clap = { version = "4", features = ["derive"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "fs", "io-util", "signal"] }
 toml = "0.9"
