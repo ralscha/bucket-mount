@@ -44,8 +44,8 @@ honour them, synchronization is refused rather than risking data loss.
 
 ### Installer (recommended)
 
-1. Download `bucket-mount-1.0.0-windows-x64-setup.exe` for Intel/AMD PCs, or
-   `bucket-mount-1.0.0-windows-arm64-setup.exe` for Windows on ARM, from a release.
+1. Download `bucket-mount-1.0.1-windows-x64-setup.exe` for Intel/AMD PCs, or
+   `bucket-mount-1.0.1-windows-arm64-setup.exe` for Windows on ARM, from a release.
 2. Double-click it and follow the prompts. Administrator rights are not required.
 3. Choose whether Bucket Mount should start when you sign in.
 
@@ -55,8 +55,8 @@ menu, and offers to start the app when it finishes. To remove the installation l
 
 ### Portable ZIP
 
-1. Download `bucket-mount-1.0.0-windows-x64-portable.zip` or
-   `bucket-mount-1.0.0-windows-arm64-portable.zip` for your PC and extract it anywhere.
+1. Download `bucket-mount-1.0.1-windows-x64-portable.zip` or
+   `bucket-mount-1.0.1-windows-arm64-portable.zip` for your PC and extract it anywhere.
 2. Double-click `bucket-mount.exe`.
 
 The portable build needs no installer and no administrator rights, but it does not add a Start
@@ -303,7 +303,7 @@ $env:BUCKET_MOUNT_UI_PREVIEW_DIR = "$env:TEMP\bucket-mount-previews"
 cargo test --lib native_editor_manages_profiles_and_encrypts_credentials -- --ignored
 ```
 
-Pushing a tag (`v1.0.0`) runs the [Windows workflow](.github/workflows/windows.yml), which checks
+Pushing a tag (`v1.0.1`) runs the [Windows workflow](.github/workflows/windows.yml), which checks
 formatting, Clippy, and tests on both architectures, then publishes both setup executables and
 portable ZIPs with SHA256 checksums on a GitHub release. Both build jobs must succeed before
 publication.

@@ -1,6 +1,6 @@
 [package]
 name = "bucket-mount"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.99"
 description = "S3 buckets as on-demand files in Windows File Explorer"
