@@ -43,3 +43,39 @@ fn init_creates_profiles_and_refuses_to_overwrite_settings() {
     assert!(String::from_utf8_lossy(&repeated.stderr).contains("configuration already exists"));
     assert_eq!(fs::read(&config_path).unwrap(), original);
 }
+
+#[test]
+fn concurrent_profile_creation_preserves_the_winners_identity() {
+    use std::sync::{Arc, Barrier};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("profiles.toml");
+    let barrier = Arc::new(Barrier::new(8));
+    let workers: Vec<_> = (0..8)
+        .map(|_| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let profiles = Profiles::default();
+                let identity = profiles.connections[0].config.device_id.clone();
+                barrier.wait();
+                profiles.create(&path).ok().map(|()| identity)
+            })
+        })
+        .collect();
+    let winners: Vec<_> = workers
+        .into_iter()
+        .filter_map(|w| w.join().unwrap())
+        .collect();
+    assert_eq!(winners.len(), 1, "exactly one creator may publish settings");
+    assert_eq!(
+        Profiles::load(&path).unwrap().connections[0]
+            .config
+            .device_id,
+        winners[0]
+    );
+    assert_eq!(
+        fs::read_dir(directory.path()).unwrap().count(),
+        1,
+        "temporary files must be cleaned up"
+    );
+}

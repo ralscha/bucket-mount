@@ -44,7 +44,8 @@ honour them, synchronization is refused rather than risking data loss.
 
 ### Installer (recommended)
 
-1. Download `bucket-mount-1.0.0-windows-x64-setup.exe` from a release.
+1. Download `bucket-mount-1.0.0-windows-x64-setup.exe` for Intel/AMD PCs, or
+   `bucket-mount-1.0.0-windows-arm64-setup.exe` for Windows on ARM, from a release.
 2. Double-click it and follow the prompts. Administrator rights are not required.
 3. Choose whether Bucket Mount should start when you sign in.
 
@@ -54,7 +55,8 @@ menu, and offers to start the app when it finishes. To remove the installation l
 
 ### Portable ZIP
 
-1. Download `bucket-mount-1.0.0-windows-x64-portable.zip` and extract it anywhere.
+1. Download `bucket-mount-1.0.0-windows-x64-portable.zip` or
+   `bucket-mount-1.0.0-windows-arm64-portable.zip` for your PC and extract it anywhere.
 2. Double-click `bucket-mount.exe`.
 
 The portable build needs no installer and no administrator rights, but it does not add a Start
@@ -259,18 +261,32 @@ quit the app and delete the extracted files.
 ## For developers
 
 ```powershell
-# Checks, tests, and packages the Windows x64 release into dist\
+# Install both target standard libraries into the pinned host toolchain
+rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
+
+# Checks, tests, and packages both Windows architectures into dist\
 .\scripts\build.ps1
+
+# Build just one architecture
+.\scripts\build.ps1 -Architecture arm64
 
 # Quick loops
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
+.\scripts\test-build.ps1  # packaging, target isolation, and checksum regression tests
 ```
 
 The build needs the pinned toolchain from [rust-toolchain.toml](rust-toolchain.toml), the Visual
-Studio C++ build tools, and a Windows SDK (`rc.exe`). `-GnuToolchainBin` builds with LLVM MinGW
-instead, and `-Offline` avoids downloads.
+Studio C++ build tools for x64 **and ARM64**, and a Windows SDK (`rc.exe`). In Visual Studio
+Installer, include the MSVC ARM64 build tools and **C++ Clang Compiler for Windows** in addition
+to Desktop development with C++. The ARM64 crypto dependency requires `clang-cl`; a standalone
+LLVM installation on PATH also works.
+The script selects the native Rust host toolchain and cross-compiles when needed. Cross builds
+compile the target's tests without executing them; CI runs all regular tests on native x64 and
+ARM64 runners. Output directories and embedded setup payloads are isolated by target, and PE
+headers are checked before packaging. `-GnuToolchainBin` retains the optional x64 LLVM MinGW
+build; ARM64 uses MSVC. `-Offline` avoids downloads.
 
 Tests that need real Windows infrastructure are `#[ignore]`d so hosted CI stays portable:
 
@@ -288,8 +304,9 @@ cargo test --lib native_editor_manages_profiles_and_encrypts_credentials -- --ig
 ```
 
 Pushing a tag (`v1.0.0`) runs the [Windows workflow](.github/workflows/windows.yml), which checks
-formatting, Clippy, and tests, then publishes the setup executable and portable ZIP with SHA256
-checksums on a GitHub release.
+formatting, Clippy, and tests on both architectures, then publishes both setup executables and
+portable ZIPs with SHA256 checksums on a GitHub release. Both build jobs must succeed before
+publication.
 
 ## License
 

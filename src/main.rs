@@ -76,13 +76,13 @@ fn run(cli: Cli) -> Result<()> {
                 "configuration already exists: {}",
                 config_path.display()
             );
-            Profiles::default().save(&config_path)?;
+            Profiles::default().create(&config_path)?;
             println!("Created {}", config_path.display());
             Ok(())
         }
         Command::Run => {
             if !config_path.exists() {
-                Profiles::default().save(&config_path)?;
+                Profiles::default().create(&config_path)?;
             }
             run_tray(config_path)
         }

@@ -1,5 +1,5 @@
 //! Saved connections and validation of their shared resources.
-use crate::config::{Config, canonical_prefix, comparable_path, write_atomic};
+use crate::config::{Config, canonical_prefix, comparable_path, write_atomic, write_atomic_new};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, fs, path::Path};
@@ -134,6 +134,15 @@ impl Profiles {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
+        write_atomic(path, self.serialized()?.as_bytes())
+    }
+
+    /// Publish initial settings without replacing another process's configuration.
+    pub fn create(&self, path: &Path) -> Result<()> {
+        write_atomic_new(path, self.serialized()?.as_bytes())
+    }
+
+    fn serialized(&self) -> Result<String> {
         self.validate_structure()?;
         let mut normalized = self.clone();
         for connection in &mut normalized.connections {
@@ -141,7 +150,7 @@ impl Profiles {
                 connection.config.prefix = prefix;
             }
         }
-        write_atomic(path, toml::to_string_pretty(&normalized)?.as_bytes())
+        Ok(toml::to_string_pretty(&normalized)?)
     }
 }
 
@@ -154,12 +163,20 @@ pub fn separate_resources(a: &Config, b: &Config) -> Result<()> {
             "Drive letters must be different"
         );
     }
-    for left in [&a.mount_dir, &a.state_dir] {
-        for right in [&b.mount_dir, &b.state_dir] {
-            let left = comparable_path(left)?;
-            let right = comparable_path(right)?;
+    // Resolve each folder once; canonicalizing repeated pairs performs needless
+    // filesystem IO for every connection comparison in the settings dialog.
+    let left = [
+        comparable_path(&a.mount_dir)?,
+        comparable_path(&a.state_dir)?,
+    ];
+    let right = [
+        comparable_path(&b.mount_dir)?,
+        comparable_path(&b.state_dir)?,
+    ];
+    for left in &left {
+        for right in &right {
             ensure!(
-                !left.starts_with(&right) && !right.starts_with(&left),
+                !left.starts_with(right) && !right.starts_with(left),
                 "Mounted folders and state folders must not overlap between connections"
             );
         }

@@ -993,6 +993,24 @@ pub fn inspect_entry(path: &Path) -> Result<(FileState, Option<FileIdentity>)> {
     Ok((state, identity))
 }
 
+/// Inspect one file through a single handle, retaining both USN checks so a
+/// concurrent edit cannot combine metadata from different versions of a file.
+pub fn scan_entry(
+    path: &Path,
+) -> Result<(std::fs::Metadata, FileState, Option<FileIdentity>, u64)> {
+    let file = attribute_handle(path)?;
+    let handle = file.as_raw_handle();
+    let version = version_handle(handle)?;
+    let metadata = file.metadata()?;
+    let (state, info) = inspect_handle(handle)?;
+    let identity = info.as_deref().map(identity_from_info).transpose()?;
+    ensure!(
+        version_handle(handle)? == version,
+        "file changed while inspecting; retrying scan"
+    );
+    Ok((metadata, state, identity, version))
+}
+
 fn identity_from_info(buffer: &[u64]) -> Result<FileIdentity> {
     let info = unsafe { &*buffer.as_ptr().cast::<CF_PLACEHOLDER_STANDARD_INFO>() };
     let start = offset_of!(CF_PLACEHOLDER_STANDARD_INFO, FileIdentity);

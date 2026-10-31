@@ -127,7 +127,10 @@ pub fn conflict_key(key: &str, device: &str) -> String {
             .collect()
     }
     let stem = truncate_utf16(stem, 80);
+    // Truncation can expose an interior dot/space as the final character,
+    // producing a Windows-invalid name just when a conflict must be saved.
     let ext = truncate_utf16(&ext, 24);
+    let ext = ext.trim_end_matches(['.', ' ']);
     let name = format!("{stem}{suffix}{ext}");
     if parent.is_empty() || parent.len() + 1 + name.len() > 1024 {
         name
@@ -175,5 +178,13 @@ mod tests {
         assert_ne!(a, conflict_key("dir/report.docx", "desktop"));
         let long_name = format!("{}.{}", "😀".repeat(90), "😀".repeat(30));
         validate_key(&conflict_key(&long_name, &"x".repeat(24))).unwrap();
+        for extension in [
+            format!("{} tail", "x".repeat(22)),
+            format!("{}😀", "x".repeat(22)),
+        ] {
+            let original = format!("report.{extension}");
+            validate_key(&original).unwrap();
+            validate_key(&conflict_key(&original, "desktop")).unwrap();
+        }
     }
 }

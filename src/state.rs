@@ -17,7 +17,8 @@ impl State {
         let db = Connection::open(path).context("open sync database")?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS objects (key TEXT PRIMARY KEY, etag TEXT NOT NULL, size INTEGER NOT NULL, modified_ms INTEGER NOT NULL, accessed_ms INTEGER NOT NULL);")?;
+            CREATE TABLE IF NOT EXISTS objects (key TEXT PRIMARY KEY, etag TEXT NOT NULL, size INTEGER NOT NULL, modified_ms INTEGER NOT NULL, accessed_ms INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS objects_lru ON objects(accessed_ms,key);")?;
         let stored: Option<String> = db
             .query_row("SELECT value FROM settings WHERE key='binding'", [], |r| {
                 r.get(0)
@@ -41,7 +42,8 @@ impl State {
     }
     pub fn all(&self) -> Result<BTreeMap<String, RemoteObject>> {
         let db = self.db.lock().unwrap_or_else(|p| p.into_inner());
-        let mut query = db.prepare("SELECT key,etag,size,modified_ms FROM objects ORDER BY key")?;
+        let mut query =
+            db.prepare_cached("SELECT key,etag,size,modified_ms FROM objects ORDER BY key")?;
         let rows = query.query_map([], |r| {
             let size: i64 = r.get(2)?;
             let size = u64::try_from(size).map_err(|e| {
@@ -87,7 +89,7 @@ impl State {
     }
     pub fn save(&self, object: &RemoteObject) -> Result<()> {
         let size = i64::try_from(object.size).context("object exceeds supported size")?;
-        self.db.lock().unwrap_or_else(|p| p.into_inner()).execute("INSERT INTO objects(key,etag,size,modified_ms,accessed_ms) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(key) DO UPDATE SET etag=excluded.etag,size=excluded.size,modified_ms=excluded.modified_ms", params![object.key,object.etag,size,object.modified_ms,now_ms()])?;
+        self.db.lock().unwrap_or_else(|p| p.into_inner()).prepare_cached("INSERT INTO objects(key,etag,size,modified_ms,accessed_ms) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(key) DO UPDATE SET etag=excluded.etag,size=excluded.size,modified_ms=excluded.modified_ms")?.execute(params![object.key,object.etag,size,object.modified_ms,now_ms()])?;
         Ok(())
     }
     pub fn remove(&self, key: &str) -> Result<()> {
@@ -110,15 +112,16 @@ impl State {
         if !touched.is_empty() {
             let transaction = db.transaction()?;
             let now = now_ms();
-            for key in touched {
-                transaction.execute(
-                    "UPDATE objects SET accessed_ms=?2 WHERE key=?1",
-                    params![key, now],
-                )?;
+            {
+                let mut update =
+                    transaction.prepare_cached("UPDATE objects SET accessed_ms=?2 WHERE key=?1")?;
+                for key in touched {
+                    update.execute(params![key, now])?;
+                }
             }
             transaction.commit()?;
         }
-        let mut q = db.prepare("SELECT key FROM objects ORDER BY accessed_ms,key")?;
+        let mut q = db.prepare_cached("SELECT key FROM objects ORDER BY accessed_ms,key")?;
         Ok(q.query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -152,5 +155,41 @@ mod tests {
         assert!(State::open(&p, "bucket-b").is_err());
         s.remove("f").unwrap();
         assert!(s.all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn lru_flushes_accesses_and_preserves_recency_when_saving_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::open(&dir.path().join("state.db"), "bucket").unwrap();
+        for key in ["a", "b", "c"] {
+            state
+                .save(&RemoteObject {
+                    key: key.into(),
+                    etag: "v1".into(),
+                    size: 1,
+                    modified_ms: 1,
+                })
+                .unwrap();
+        }
+        // Give every file the same old access time without relying on clock sleeps.
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE objects SET accessed_ms=1", [])
+            .unwrap();
+        state.touch("a").unwrap();
+        state.touch("a").unwrap();
+        state.touch("missing").unwrap();
+        assert_eq!(state.lru().unwrap(), ["b", "c", "a"]);
+        state
+            .save(&RemoteObject {
+                key: "b".into(),
+                etag: "v2".into(),
+                size: 2,
+                modified_ms: 2,
+            })
+            .unwrap();
+        assert_eq!(state.lru().unwrap(), ["b", "c", "a"]);
     }
 }

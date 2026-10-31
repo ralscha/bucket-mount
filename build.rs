@@ -119,6 +119,31 @@ fn setup_payload() {
                 bytes.starts_with(b"MZ"),
                 "setup payload must be a Windows executable"
             );
+            let pe_offset = bytes
+                .get(0x3c..0x40)
+                .map(|offset| u32::from_le_bytes(offset.try_into().unwrap()) as usize)
+                .filter(|offset| *offset >= 64)
+                .expect("setup payload must have a PE header");
+            let header = bytes
+                .get(pe_offset..pe_offset.checked_add(6).expect("PE offset overflow"))
+                .expect("setup payload PE header is truncated");
+            assert_eq!(
+                &header[..4],
+                b"PE\0\0",
+                "invalid setup payload PE signature"
+            );
+            let architecture = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+            let expected_machine = match architecture.as_str() {
+                "x86_64" => 0x8664,
+                "aarch64" => 0xaa64,
+                "x86" => 0x014c,
+                _ => panic!("unsupported setup payload architecture: {architecture}"),
+            };
+            assert_eq!(
+                u16::from_le_bytes(header[4..6].try_into().unwrap()),
+                expected_machine,
+                "setup payload architecture must match the setup target ({architecture})"
+            );
             println!("cargo::rerun-if-changed={}", path.display());
             format!("static APPLICATION: &[u8] = include_bytes!({path:?});\n")
         }

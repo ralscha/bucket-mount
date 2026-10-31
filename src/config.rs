@@ -183,6 +183,14 @@ impl Config {
 }
 
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic_impl(path, bytes, true)
+}
+
+pub(crate) fn write_atomic_new(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic_impl(path, bytes, false)
+}
+
+fn write_atomic_impl(path: &Path, bytes: &[u8], overwrite: bool) -> Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
@@ -195,7 +203,7 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        replace_file(&temporary, path)?;
+        replace_file(&temporary, path, overwrite)?;
         Ok(())
     })();
     if result.is_err() {
@@ -205,7 +213,7 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+fn replace_file(source: &Path, destination: &Path, overwrite: bool) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
@@ -221,7 +229,12 @@ fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
         MoveFileExW(
             source.as_ptr(),
             destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            MOVEFILE_WRITE_THROUGH
+                | if overwrite {
+                    MOVEFILE_REPLACE_EXISTING
+                } else {
+                    0
+                },
         )
     };
     if result == 0 {
@@ -232,8 +245,15 @@ fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
-    fs::rename(source, destination)
+fn replace_file(source: &Path, destination: &Path, overwrite: bool) -> std::io::Result<()> {
+    if overwrite {
+        fs::rename(source, destination)
+    } else {
+        // The temporary is on the same filesystem. Linking publishes the whole
+        // file atomically and fails if another creator won the destination.
+        fs::hard_link(source, destination)?;
+        fs::remove_file(source)
+    }
 }
 
 pub(crate) fn canonical_prefix(prefix: &str) -> Result<String> {

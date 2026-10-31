@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::Path,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -457,6 +458,7 @@ impl Remote for S3Remote {
     async fn list(&self) -> Result<Vec<RemoteObject>, RemoteError> {
         let mut objects = Vec::new();
         let mut continuation = None;
+        let mut seen_tokens = HashSet::new();
         loop {
             let output = self
                 .client
@@ -500,7 +502,7 @@ impl Remote for S3Remote {
                 .context("provider truncated the listing without a continuation token")?
                 .to_owned();
             ensure_remote(
-                continuation.as_ref() != Some(&next),
+                seen_tokens.insert(next.clone()),
                 "provider repeated its continuation token",
             )?;
             continuation = Some(next);
@@ -1191,6 +1193,29 @@ mod tests {
             vec![("first.txt", 123), ("second.txt", 456)]
         );
         assert_eq!(server.requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn listing_rejects_continuation_token_cycles() {
+        let mut page = 0;
+        let server = TestServer::start(move |_| {
+            page += 1;
+            // The old check caught A -> A, but would loop forever on A -> B -> A.
+            let token = if page % 2 == 1 { "a" } else { "b" };
+            TestResponse::new(200, format!(
+                "<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>{token}</NextContinuationToken></ListBucketResult>"
+            ).into_bytes()).header("Content-Type", "application/xml")
+        });
+        let error = tokio::time::timeout(Duration::from_secs(5), server.remote().list())
+            .await
+            .expect("listing must stop when a token repeats")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("repeated its continuation token")
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]

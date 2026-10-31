@@ -279,6 +279,11 @@ impl Engine {
                 // need the conversion walk on every pass.
                 if entry.metadata()?.file_attributes() & 0x400 == 0 {
                     platform::ensure_directory_placeholder(entry.path())?;
+                } else {
+                    ensure!(
+                        platform::inspect(entry.path())?.placeholder,
+                        "unsupported reparse directory in sync folder"
+                    );
                 }
                 continue;
             }
@@ -293,13 +298,7 @@ impl Engine {
                 .context("non-Unicode filename")?
                 .replace('\\', "/");
             paths::validate_key(&key)?;
-            let version = platform::file_version(entry.path())?;
-            let metadata = entry.metadata()?;
-            let (state, identity) = platform::inspect_entry(entry.path())?;
-            ensure!(
-                platform::file_version(entry.path())? == version,
-                "file changed while inspecting; retrying scan"
-            );
+            let (metadata, state, identity, version) = platform::scan_entry(entry.path())?;
             ensure!(
                 metadata.file_attributes() & 0x400 == 0 || state.placeholder,
                 "unsupported reparse point in sync folder"
@@ -608,7 +607,7 @@ pub fn run_loop(mut engine: Engine, runtime: &tokio::runtime::Runtime, control: 
     let mut due = Instant::now();
     while !control.stopping.load(Ordering::Relaxed) {
         if !control.paused.load(Ordering::Relaxed)
-            && (Instant::now() >= due || control.sync_requested.swap(false, Ordering::Relaxed))
+            && (control.sync_requested.swap(false, Ordering::Relaxed) || Instant::now() >= due)
         {
             control.set_status(SyncState::Syncing, "Synchronizing…".into());
             match runtime.block_on(engine.sync_once()) {
