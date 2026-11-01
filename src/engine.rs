@@ -4,6 +4,7 @@ use crate::{
     platform::{self, CloudFiles, DriveAlias, Hydrator},
     remote::{Expected, Remote, RemoteError, RemoteObject},
     state::State,
+    sync_issue::{FileOperation, SyncIssue, is_busy},
     tray::{Control, SyncState},
 };
 use anyhow::{Context, Result, ensure};
@@ -145,7 +146,8 @@ impl Engine {
         let generation = namespace
             .snapshot()
             .context("a local rename or deletion is in progress")?;
-        let local = self.scan()?;
+        let mut scan = self.scan()?;
+        let local = &scan.files;
         ensure!(
             namespace.snapshot() == Some(generation),
             "local namespace changed during scan; retrying"
@@ -168,9 +170,11 @@ impl Engine {
             .values()
             .filter_map(|f| f.moved_from.clone())
             .collect();
+        // Missing files in an incomplete scan may have been renamed into a busy
+        // subtree. Never delete their backing objects, even outside that subtree.
         let deletions: BTreeSet<_> = baseline
             .keys()
-            .filter(|k| !local.contains_key(*k) && remote.contains_key(*k))
+            .filter(|k| scan.complete() && !local.contains_key(*k) && remote.contains_key(*k))
             .cloned()
             .collect();
         self.missing.retain(|k, _| deletions.contains(k));
@@ -178,24 +182,29 @@ impl Engine {
             self.missing.entry(key.clone()).or_insert_with(Instant::now);
         }
         let mut stats = SyncStats::default();
+        stats.pending += keys.iter().filter(|k| scan.blocks(k)).count();
         {
             let this = &*self;
-            let mut work =
-                futures_util::stream::iter(keys.iter().filter(|k| !deletions.contains(*k)))
-                    .map(|key| {
-                        let (base, object, file) =
-                            (baseline.get(key), remote.get(key), local.get(key));
-                        async move {
-                            let mut part = SyncStats::default();
-                            if let Err(e) = this.reconcile(key, base, object, file, &mut part).await
-                            {
-                                part.errors += 1;
-                                tracing::warn!(key,error=%e,"file sync deferred");
-                            }
-                            part
-                        }
-                    })
-                    .buffer_unordered(self.config.upload_concurrency);
+            let mut work = futures_util::stream::iter(
+                keys.iter()
+                    .filter(|k| !deletions.contains(*k) && !scan.blocks(k)),
+            )
+            .map(|key| {
+                let (base, object, file) = (baseline.get(key), remote.get(key), local.get(key));
+                async move {
+                    let mut part = SyncStats::default();
+                    if let Err(e) = this.reconcile(key, base, object, file, &mut part).await {
+                        part.record(
+                            &e,
+                            Some(this.config.mount_dir.join(key.replace('/', "\\"))),
+                            "Synchronize file",
+                        );
+                        tracing::warn!(key,error=%format!("{e:#}"),"file sync deferred");
+                    }
+                    part
+                }
+            })
+            .buffer_unordered(self.config.upload_concurrency);
             while let Some(part) = work.next().await {
                 stats.merge(part);
             }
@@ -214,7 +223,7 @@ impl Engine {
             if old.etag != current.etag {
                 let path = paths::local_path(&self.config.mount_dir, &key)?;
                 if let Err(e) = self.materialize(&path, current) {
-                    stats.errors += 1;
+                    stats.record(&e, Some(path), "Restore remote edit");
                     tracing::warn!(key,%e,"restore concurrent remote edit deferred");
                 } else {
                     stats.conflicts += 1;
@@ -252,39 +261,45 @@ impl Engine {
                     stats.pending += 1;
                 }
                 Err(e) => {
-                    stats.errors += 1;
                     tracing::warn!(key,%e,"remote deletion deferred");
+                    stats.record(&e.into(), Some(path), "Delete remote object");
                 }
             }
         }
-        self.evict(&mut stats)?;
+        self.evict(&mut stats, &scan)?;
         self.observed
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .retain(|k, _| local.contains_key(k));
+        stats.errors += scan.issues.len();
+        stats.issues.append(&mut scan.issues);
         Ok(stats)
     }
 
-    fn scan(&self) -> Result<BTreeMap<String, LocalFile>> {
-        let mut files = BTreeMap::new();
-        for entry in walkdir::WalkDir::new(&self.config.mount_dir).follow_links(false) {
-            let entry =
-                entry.context("scan local folder (deletion processing cancelled on error)")?;
+    fn scan(&self) -> Result<LocalScan> {
+        let mut scan = LocalScan::default();
+        let mut directories = Vec::new();
+        let mut entries = walkdir::WalkDir::new(&self.config.mount_dir)
+            .follow_links(false)
+            .into_iter();
+        for entry in entries.by_ref() {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    let path = error.path().unwrap_or(&self.config.mount_dir).to_path_buf();
+                    let error = FileOperation::wrap(&path, "Scan folder", error.into());
+                    if !is_busy(&error) {
+                        return Err(error);
+                    }
+                    scan.defer(&self.config.mount_dir, &path, &error);
+                    continue;
+                }
+            };
             if entry.depth() == 0 {
                 continue;
             }
             if entry.file_type().is_dir() {
-                // Directory placeholders let CFAPI notify us before parent renames.
-                // Placeholders keep the reparse attribute, so only plain directories
-                // need the conversion walk on every pass.
-                if entry.metadata()?.file_attributes() & 0x400 == 0 {
-                    platform::ensure_directory_placeholder(entry.path())?;
-                } else {
-                    ensure!(
-                        platform::inspect(entry.path())?.placeholder,
-                        "unsupported reparse directory in sync folder"
-                    );
-                }
+                directories.push(entry.path().to_path_buf());
                 continue;
             }
             ensure!(
@@ -298,7 +313,18 @@ impl Engine {
                 .context("non-Unicode filename")?
                 .replace('\\', "/");
             paths::validate_key(&key)?;
-            let (metadata, state, identity, version) = platform::scan_entry(entry.path())?;
+            let (metadata, state, identity, version) = match platform::scan_entry(entry.path())
+                .map_err(|e| FileOperation::wrap(entry.path(), "Inspect file", e))
+            {
+                Ok(info) => info,
+                Err(error) => {
+                    if !is_busy(&error) {
+                        return Err(error);
+                    }
+                    scan.defer(&self.config.mount_dir, entry.path(), &error);
+                    continue;
+                }
+            };
             ensure!(
                 metadata.file_attributes() & 0x400 == 0 || state.placeholder,
                 "unsupported reparse point in sync folder"
@@ -308,7 +334,7 @@ impl Engine {
                 .filter(|id| id.key != key)
                 .map(|id| id.key.clone());
             let etag = identity.map(|id| id.etag);
-            files.insert(
+            scan.files.insert(
                 key,
                 LocalFile {
                     size: metadata.len(),
@@ -320,7 +346,41 @@ impl Engine {
                 },
             );
         }
-        Ok(files)
+        // WalkDir opens an enumeration handle before yielding a directory. An
+        // exclusive CFAPI conversion while that handle is alive locks against
+        // our own scan, even with no other application using the folder. Finish
+        // and drop the walker before converting directories (parents first).
+        drop(entries);
+        for path in directories {
+            let key = path
+                .strip_prefix(&self.config.mount_dir)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if scan.blocks(&key) {
+                continue;
+            }
+            let result = (|| -> Result<()> {
+                let metadata = std::fs::symlink_metadata(&path)?;
+                ensure!(metadata.is_dir(), "folder changed during scan; retrying");
+                if metadata.file_attributes() & 0x400 == 0 {
+                    platform::ensure_directory_placeholder(&path)?;
+                } else {
+                    ensure!(
+                        platform::inspect(&path)?.placeholder,
+                        "unsupported reparse directory in sync folder"
+                    );
+                }
+                Ok(())
+            })()
+            .map_err(|e| FileOperation::wrap(&path, "Prepare folder for synchronization", e));
+            if let Err(error) = result {
+                if !is_busy(&error) {
+                    return Err(error);
+                }
+                scan.defer(&self.config.mount_dir, &path, &error);
+            }
+        }
+        Ok(scan)
     }
 
     async fn reconcile(
@@ -473,15 +533,24 @@ impl Engine {
         self.state.save(object)
     }
 
-    fn evict(&self, stats: &mut SyncStats) -> Result<()> {
+    fn evict(&self, stats: &mut SyncStats, scan: &LocalScan) -> Result<()> {
         let mut candidates = Vec::new();
         let (mut bytes, mut count) = (0u64, 0usize);
         for key in self.state.lru()? {
+            if scan.blocks(&key) {
+                continue;
+            }
             let path = paths::local_path(&self.config.mount_dir, &key)?;
             if !path.exists() {
                 continue;
             }
-            let info = platform::inspect(&path)?;
+            let info = match platform::inspect(&path) {
+                Ok(info) => info,
+                Err(error) => {
+                    stats.record(&error, Some(path), "Inspect cached file");
+                    continue;
+                }
+            };
             if info.hydrated_bytes == 0 {
                 continue;
             }
@@ -509,6 +578,44 @@ impl Engine {
         stats.over_budget =
             bytes > self.config.cache_max_bytes || count > self.config.cache_max_files;
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct LocalScan {
+    files: BTreeMap<String, LocalFile>,
+    blocked: Vec<String>,
+    issues: Vec<SyncIssue>,
+}
+
+impl LocalScan {
+    fn complete(&self) -> bool {
+        self.blocked.is_empty()
+    }
+
+    fn blocks(&self, key: &str) -> bool {
+        let key = key.to_uppercase();
+        self.blocked.iter().any(|prefix| {
+            prefix.is_empty()
+                || key == *prefix
+                || key
+                    .strip_prefix(prefix)
+                    .is_some_and(|tail| tail.starts_with('/'))
+        })
+    }
+
+    fn defer(&mut self, root: &Path, path: &Path, error: &anyhow::Error) {
+        let issue = SyncIssue::from_error(error, Some(path.to_owned()), "Scan folder");
+        let blocked = issue
+            .path
+            .as_deref()
+            .unwrap_or(path)
+            .strip_prefix(root)
+            .map(|p| p.to_string_lossy().replace('\\', "/").to_uppercase())
+            .unwrap_or_default();
+        tracing::warn!(path=?issue.path, error=%issue.details, "scan item busy; remote deletions suspended");
+        self.blocked.push(blocked);
+        self.issues.push(issue);
     }
 }
 
@@ -562,6 +669,7 @@ impl Drop for Snapshot {
 
 #[derive(Default, Debug)]
 pub struct SyncStats {
+    pub issues: Vec<SyncIssue>,
     pub uploaded: usize,
     pub refreshed: usize,
     pub removed: usize,
@@ -574,6 +682,14 @@ pub struct SyncStats {
     pub over_budget: bool,
 }
 impl SyncStats {
+    fn record(&mut self, error: &anyhow::Error, path: Option<PathBuf>, operation: &str) {
+        self.errors += 1;
+        let issue = SyncIssue::from_error(error, path, operation);
+        if !self.issues.iter().any(|old| old.same_item(&issue)) {
+            self.issues.push(issue);
+        }
+    }
+
     fn merge(&mut self, other: Self) {
         self.uploaded += other.uploaded;
         self.refreshed += other.refreshed;
@@ -581,6 +697,11 @@ impl SyncStats {
         self.conflicts += other.conflicts;
         self.pending += other.pending;
         self.errors += other.errors;
+        for issue in other.issues {
+            if !self.issues.iter().any(|old| old.same_item(&issue)) {
+                self.issues.push(issue);
+            }
+        }
     }
 }
 impl std::fmt::Display for SyncStats {
@@ -603,6 +724,7 @@ impl std::fmt::Display for SyncStats {
 }
 
 pub fn run_loop(mut engine: Engine, runtime: &tokio::runtime::Runtime, control: &Control) {
+    control.retry_available.store(true, Ordering::Release);
     let interval = Duration::from_secs(engine.config.poll_interval_secs);
     let mut due = Instant::now();
     while !control.stopping.load(Ordering::Relaxed) {
@@ -613,18 +735,14 @@ pub fn run_loop(mut engine: Engine, runtime: &tokio::runtime::Runtime, control: 
             match runtime.block_on(engine.sync_once()) {
                 Ok(stats) => {
                     tracing::info!(?stats, "sync complete");
-                    control.set_status(
-                        if stats.errors == 0 {
-                            SyncState::Idle
-                        } else {
-                            SyncState::Error
-                        },
-                        stats.to_string(),
-                    );
+                    control.finish_sync(stats.to_string(), stats.issues);
                 }
                 Err(e) => {
-                    tracing::warn!(error=%e,"sync deferred");
-                    control.set_status(SyncState::Error, format!("Sync deferred: {e}"));
+                    tracing::warn!(error=%format!("{e:#}"),"sync deferred");
+                    control.finish_sync(
+                        String::new(),
+                        vec![SyncIssue::from_error(&e, None, "Synchronize connection")],
+                    );
                 }
             }
             due = Instant::now() + interval;
@@ -637,6 +755,30 @@ pub fn run_loop(mut engine: Engine, runtime: &tokio::runtime::Runtime, control: 
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn incomplete_scan_blocks_case_aliases_and_subtrees_but_not_siblings() {
+        let root = Path::new(r"C:\mount");
+        let mut scan = LocalScan::default();
+        assert!(scan.complete());
+        let path = root.join("Busy");
+        scan.defer(
+            root,
+            &path,
+            &anyhow::Error::new(std::io::Error::from_raw_os_error(32)),
+        );
+        assert!(!scan.complete());
+        assert!(scan.blocks("busy"));
+        assert!(scan.blocks("BUSY/nested/file.txt"));
+        assert!(!scan.blocks("busy-other/file.txt"));
+        assert!(!scan.blocks("unrelated.txt"));
+        scan.defer(
+            root,
+            root,
+            &anyhow::Error::new(std::io::Error::from_raw_os_error(32)),
+        );
+        assert!(scan.blocks("anything.txt"));
+    }
 
     #[derive(Default)]
     struct MemoryRemote {
@@ -882,6 +1024,68 @@ mod tests {
             listed.iter().any(|o| o.key == "after-rename.bin")
                 && !listed.iter().any(|o| o.key == "before-rename.bin"),
             "rename did not propagate safely"
+        );
+        // A renamed placeholder hidden in a busy, not-yet-converted directory
+        // must keep its old backing object. Unrelated remote files still arrive.
+        remote.put(
+            "keep-backing.txt",
+            b"preserve this while scan is incomplete",
+        );
+        runtime.block_on(one.sync_once())?;
+        let busy_dir = a.mount_dir.join("busy-folder");
+        std::fs::create_dir(&busy_dir)?;
+        std::fs::rename(
+            a.mount_dir.join("keep-backing.txt"),
+            busy_dir.join("renamed.txt"),
+        )?;
+        let held = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&busy_dir)?;
+        remote.put("unrelated.txt", b"available during the lock");
+        for _ in 0..2 {
+            let busy = runtime.block_on(one.sync_once())?;
+            ensure!(
+                busy.issues
+                    .iter()
+                    .any(|i| i.busy && i.path.as_ref() == Some(&busy_dir)),
+                "missing busy folder details: {busy:?}"
+            );
+            ensure!(
+                a.mount_dir.join("unrelated.txt").exists(),
+                "unrelated refresh blocked"
+            );
+            ensure!(
+                remote
+                    .objects
+                    .lock()
+                    .unwrap()
+                    .contains_key("keep-backing.txt"),
+                "incomplete scan deleted a backing object"
+            );
+            std::thread::sleep(Duration::from_millis(1100));
+        }
+        drop(held);
+        runtime.block_on(one.sync_once())?;
+        std::thread::sleep(Duration::from_millis(1100));
+        let recovered = runtime.block_on(one.sync_once())?;
+        ensure!(
+            recovered.issues.is_empty(),
+            "lock issue did not clear: {recovered:?}"
+        );
+        ensure!(
+            remote
+                .objects
+                .lock()
+                .unwrap()
+                .contains_key("busy-folder/renamed.txt"),
+            "renamed file did not upload after the folder lock was released"
+        );
+        ensure!(
+            std::fs::read(busy_dir.join("renamed.txt"))?
+                == b"preserve this while scan is incomplete",
+            "renamed contents lost"
         );
         drop(one);
         drop(two);

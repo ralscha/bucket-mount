@@ -1,9 +1,11 @@
 //! Small native Windows notification-area UI. No browser or background UI runtime.
 
+use crate::sync_issue::SyncIssue;
 use std::sync::{
     Mutex,
     atomic::{AtomicBool, AtomicU8, Ordering},
 };
+use std::time::Duration;
 
 /// Visual state is explicit so localized status text never controls the icon.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13,6 +15,7 @@ pub enum SyncState {
     Syncing,
     Paused,
     Error,
+    Waiting,
 }
 
 /// Shared commands and human-readable status between the tray and sync worker.
@@ -20,11 +23,69 @@ pub struct Control {
     pub paused: AtomicBool,
     pub stopping: AtomicBool,
     pub sync_requested: AtomicBool,
+    pub retry_available: AtomicBool,
     status: Mutex<String>,
+    issues: Mutex<Vec<SyncIssue>>,
     state: AtomicU8,
 }
 
 impl Control {
+    pub fn issues(&self) -> Vec<SyncIssue> {
+        self.issues
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    pub fn finish_sync(&self, summary: String, mut issues: Vec<SyncIssue>) {
+        issues.sort_by(|a, b| {
+            a.path
+                .cmp(&b.path)
+                .then(a.operation.cmp(&b.operation))
+                .then(a.busy.cmp(&b.busy))
+        });
+        issues.dedup_by(|a, b| a.same_item(b));
+        let mut previous = self.issues.lock().unwrap_or_else(|p| p.into_inner());
+        for issue in &mut issues {
+            if let Some(old) = previous.iter().find(|old| old.same_item(issue)) {
+                issue.first_seen = old.first_seen;
+            }
+        }
+        let state = if issues.is_empty() {
+            SyncState::Idle
+        } else if issues
+            .iter()
+            .all(|i| i.busy && i.first_seen.elapsed() < Duration::from_secs(60))
+        {
+            SyncState::Waiting
+        } else {
+            SyncState::Error
+        };
+        let text = if issues.is_empty() {
+            summary
+        } else {
+            format!(
+                "{} item{} {}. Open Details for recovery steps.",
+                issues.len(),
+                if issues.len() == 1 { "" } else { "s" },
+                if state == SyncState::Waiting {
+                    "waiting for access; retrying automatically"
+                } else if issues.len() == 1 {
+                    "needs attention; retrying automatically"
+                } else {
+                    "need attention; retrying automatically"
+                }
+            )
+        };
+        *previous = issues;
+        self.set_status(state, text);
+    }
+
+    pub fn request_sync(&self) {
+        self.paused.store(false, Ordering::Release);
+        self.sync_requested.store(true, Ordering::Release);
+    }
+
     pub fn set_status(&self, state: SyncState, status: String) {
         *self.status.lock().unwrap_or_else(|p| p.into_inner()) = status;
         self.state.store(state as u8, Ordering::Release);
@@ -45,6 +106,7 @@ impl Control {
             0 => SyncState::Idle,
             1 => SyncState::Syncing,
             2 => SyncState::Paused,
+            4 => SyncState::Waiting,
             _ => SyncState::Error,
         }
     }
@@ -56,7 +118,9 @@ impl Default for Control {
             paused: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             sync_requested: AtomicBool::new(false),
+            retry_available: AtomicBool::new(false),
             status: Mutex::new("Starting…".into()),
+            issues: Mutex::new(Vec::new()),
             state: AtomicU8::new(SyncState::Syncing as u8),
         }
     }
@@ -68,6 +132,10 @@ pub use native::run;
 #[cfg(windows)]
 #[path = "tray_design.rs"]
 mod design;
+
+#[cfg(windows)]
+#[path = "sync_issues_window.rs"]
+mod issues_window;
 
 #[cfg(windows)]
 mod native {
@@ -215,6 +283,7 @@ mod native {
         dirty: Cell<bool>,
         control: Arc<Control>,
         form: Cell<HWND>,
+        issues: super::issues_window::Window,
         taskbar_created: u32,
         icons: RefCell<IconCache>,
         light_taskbar: Cell<bool>,
@@ -269,6 +338,7 @@ mod native {
                 config_path,
                 control: Arc::new(Control::default()),
                 form: Cell::new(null_mut()),
+                issues: super::issues_window::Window::default(),
                 taskbar_created: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
                 icons: RefCell::new(IconCache::default()),
                 light_taskbar: Cell::new(taskbar_is_light()),
@@ -321,12 +391,21 @@ mod native {
                     break;
                 }
                 let form = state.form.get();
-                if form.is_null() || IsDialogMessageW(form, &message) == 0 {
+                let issues = state.issues.hwnd.get();
+                if (issues.is_null() || IsDialogMessageW(issues, &message) == 0)
+                    && (form.is_null() || IsDialogMessageW(form, &message) == 0)
+                {
                     TranslateMessage(&message);
                     DispatchMessageW(&message);
                 }
             }
             state.control.stopping.store(true, Ordering::Release);
+            if !state.issues.hwnd.get().is_null() {
+                DestroyWindow(state.issues.hwnd.get());
+            }
+            if !state.form.get().is_null() {
+                DestroyWindow(state.form.get());
+            }
             if IsWindow(hwnd) != 0 {
                 DestroyWindow(hwnd);
             }
@@ -457,6 +536,8 @@ mod native {
             SyncState::Paused
         } else if enabled.iter().any(|c| c.sync_state() == SyncState::Syncing) {
             SyncState::Syncing
+        } else if enabled.iter().any(|c| c.sync_state() == SyncState::Waiting) {
+            SyncState::Waiting
         } else {
             SyncState::Idle
         };
@@ -466,6 +547,11 @@ mod native {
             if errors > 0 {
                 format!(
                     "{} connections enabled; {errors} need attention",
+                    enabled.len()
+                )
+            } else if state == SyncState::Waiting {
+                format!(
+                    "{} connections enabled; waiting for file access",
                     enabled.len()
                 )
             } else {
@@ -496,6 +582,7 @@ mod native {
                     Some(SyncState::Syncing) => "Synchronizing…",
                     Some(SyncState::Paused) => "Paused",
                     Some(SyncState::Error) => "Needs attention",
+                    Some(SyncState::Waiting) => "Waiting for file access",
                     None if new_connection => "Ready to set up",
                     None => "Not running",
                 }
@@ -508,6 +595,20 @@ mod native {
                 SetWindowTextW(
                     GetDlgItem(ui.form.get(), PROFILE_STATUS),
                     wide(text).as_ptr(),
+                );
+            }
+        }
+        if !ui.issues.hwnd.get().is_null() {
+            let id = ui.issues.connection_id.borrow().clone();
+            let connection = profiles
+                .connections
+                .iter()
+                .find(|c| c.config.device_id == id);
+            unsafe {
+                ui.issues.refresh(
+                    connection.map_or("Removed connection", |c| c.name.as_str()),
+                    connection.and_then(|c| workers.control(&c.config.device_id)),
+                    connection.map_or(15, |c| c.config.poll_interval_secs),
                 );
             }
         }
@@ -563,6 +664,7 @@ mod native {
             SyncState::Syncing => 1,
             SyncState::Paused => 2,
             SyncState::Error => 3,
+            SyncState::Waiting => 1,
         }
     }
 
@@ -1845,7 +1947,26 @@ mod native {
                         ui.dirty.set(true);
                     } else {
                         match id {
-                            STATUS_DETAILS => alert(hwnd, &field(hwnd, PROFILE_STATUS), false),
+                            STATUS_DETAILS => {
+                                let connection = ui
+                                    .profiles
+                                    .borrow()
+                                    .connections
+                                    .get(ui.editing.get())
+                                    .cloned();
+                                if let Some(connection) = connection {
+                                    match ui.issues.show(hwnd, &connection.config.device_id) {
+                                        Ok(()) => refresh_status(ui),
+                                        Err(error) => alert(hwnd, &format!("{error:#}"), true),
+                                    }
+                                } else {
+                                    alert(
+                                        hwnd,
+                                        "Save this connection to start synchronization.",
+                                        false,
+                                    );
+                                }
+                            }
                             SAVE => {
                                 if let Err(error) = save_form(hwnd, ui) {
                                     alert(
@@ -1899,7 +2020,7 @@ mod native {
     }
 
     #[cfg(test)]
-    mod tests {
+    pub(super) mod tests {
         use super::*;
         use std::collections::BTreeSet;
         use windows_sys::Win32::Graphics::Gdi::{
@@ -1926,7 +2047,7 @@ mod native {
             }
         }
 
-        unsafe fn capture_preview(hwnd: HWND, path: &Path) {
+        pub(in crate::tray) unsafe fn capture_preview(hwnd: HWND, path: &Path) {
             use windows_sys::Win32::Graphics::Gdi::*;
             unsafe {
                 RedrawWindow(
@@ -2267,6 +2388,7 @@ mod native {
                 dirty: Cell::new(false),
                 control: Arc::new(Control::default()),
                 form: Cell::new(null_mut()),
+                issues: super::super::issues_window::Window::default(),
                 taskbar_created: 0,
                 icons: RefCell::new(IconCache::default()),
                 light_taskbar: Cell::new(false),
@@ -2427,6 +2549,7 @@ mod native {
                     dirty: Cell::new(false),
                     control: Arc::new(Control::default()),
                     form: Cell::new(null_mut()),
+                    issues: super::super::issues_window::Window::default(),
                     taskbar_created: 0,
                     icons: RefCell::new(IconCache::default()),
                     light_taskbar: Cell::new(false),
@@ -2511,5 +2634,50 @@ mod native {
                 DestroyWindow(form);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn lock_retries_escalate_without_resetting_age_and_clear_on_success() {
+        let control = Control::default();
+        let error = anyhow::Error::new(std::io::Error::from_raw_os_error(32));
+        let mut issue = SyncIssue::from_error(&error, Some(r"C:\mount\file.txt".into()), "Upload");
+        control.finish_sync(String::new(), vec![issue.clone()]);
+        assert_eq!(control.sync_state(), SyncState::Waiting);
+        issue.first_seen = Instant::now() - Duration::from_secs(65);
+        control.issues.lock().unwrap()[0] = issue.clone();
+        control.set_status(SyncState::Syncing, "Retrying".into());
+        assert_eq!(
+            control.issues().len(),
+            1,
+            "keep issues visible during a retry"
+        );
+        let retry = SyncIssue::from_error(&error, issue.path.clone(), "Upload");
+        control.finish_sync(String::new(), vec![retry]);
+        assert_eq!(control.sync_state(), SyncState::Error);
+        assert_eq!(control.issues()[0].first_seen, issue.first_seen);
+        control.paused.store(true, Ordering::Release);
+        control.request_sync();
+        assert!(!control.paused.load(Ordering::Acquire));
+        assert!(control.sync_requested.load(Ordering::Acquire));
+        control.finish_sync("Up to date".into(), Vec::new());
+        assert_eq!(control.sync_state(), SyncState::Idle);
+        assert!(control.issues().is_empty());
+        let denied = SyncIssue::from_error(
+            &anyhow::Error::new(std::io::Error::from_raw_os_error(5)),
+            issue.path,
+            "Upload",
+        );
+        control.finish_sync(String::new(), vec![denied]);
+        assert_eq!(
+            control.sync_state(),
+            SyncState::Error,
+            "non-lock errors need attention immediately"
+        );
     }
 }

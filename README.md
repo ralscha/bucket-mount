@@ -44,8 +44,8 @@ honour them, synchronization is refused rather than risking data loss.
 
 ### Installer (recommended)
 
-1. Download `bucket-mount-1.0.1-windows-x64-setup.exe` for Intel/AMD PCs, or
-   `bucket-mount-1.0.1-windows-arm64-setup.exe` for Windows on ARM, from a release.
+1. Download `bucket-mount-1.0.2-windows-x64-setup.exe` for Intel/AMD PCs, or
+   `bucket-mount-1.0.2-windows-arm64-setup.exe` for Windows on ARM, from a release.
 2. Double-click it and follow the prompts. Administrator rights are not required.
 3. Choose whether Bucket Mount should start when you sign in.
 
@@ -55,8 +55,8 @@ menu, and offers to start the app when it finishes. To remove the installation l
 
 ### Portable ZIP
 
-1. Download `bucket-mount-1.0.1-windows-x64-portable.zip` or
-   `bucket-mount-1.0.1-windows-arm64-portable.zip` for your PC and extract it anywhere.
+1. Download `bucket-mount-1.0.2-windows-x64-portable.zip` or
+   `bucket-mount-1.0.2-windows-arm64-portable.zip` for your PC and extract it anywhere.
 2. Double-click `bucket-mount.exe`.
 
 The portable build needs no installer and no administrator rights, but it does not add a Start
@@ -122,8 +122,17 @@ taskbar:
 
 ![Tray icon states](docs/screenshots/tray-states.png)
 
-Hovering over the icon shows a summary; **Details** in the Connections window shows the full status
-or connection error.
+Hovering over the icon shows a summary. **Details** in the Connections window opens **Sync issues**,
+which lists affected files and folders, explains what to do, and updates automatically as issues
+clear. Select an item to **Retry now**, **Show in Explorer**, or **Copy details**. Expand
+**Show technical details** to see the failed operation and error code. While paused, the retry
+button becomes **Resume and retry**; a stopped connection instead needs **Save and apply**.
+
+A temporary file lock appears as **Waiting for file access**. Save your work and close the
+application using the item; Bucket Mount retries automatically at the configured interval (15
+seconds by default). A lock that persists across retries for a minute changes to **Needs attention**.
+If a busy item prevents a complete folder scan, unrelated files can still synchronize, but remote
+deletions wait for a complete scan so unscanned or renamed files cannot be mistaken for deletions.
 
 ### The tray menu
 
@@ -241,7 +250,8 @@ represent faithfully:
 | **Cannot connect** | Select the connection to read the full error. Check endpoint, bucket, region, credentials, and bucket permissions, then **Save and apply**. `check` prints the same details on the console. |
 | **`AccessDenied` on save or during the probe** | The credentials need list, read, write, delete, and multipart-upload rights, including on `<prefix>.bucket-mount/probes/`. |
 | **OVHcloud connection fails** | Enable **OVHcloud conditional requests**. `InvalidAccessKeyId` means the key does not belong to that Object Storage project and endpoint — re-enter both keys. |
-| **`Sync deferred: Windows namespace collision`** | Two bucket objects map to the same Windows path. Rename one of them in the bucket. |
+| **`Windows namespace collision` in Details** | Two bucket objects map to the same Windows path. Rename one of them in the bucket. |
+| **Waiting for file access / `0x80070020`** | Open **Details** to find the file or folder. Save your work and close the application using it, then **Retry now**, or wait for the automatic retry. |
 | **Saved credentials cannot be unlocked** | Windows could not decrypt them (another account, another PC, or a reset profile). Enter both keys again. |
 | **Settings did not take effect** | Click **Save and apply** and let the current synchronization finish; a running connection completes its pass before restarting with the new settings. |
 | **A file will not open offline** | It may not have been downloaded yet, or its cached copy was evicted. Reconnect and open it with Bucket Mount running. |
@@ -303,10 +313,13 @@ $env:BUCKET_MOUNT_UI_PREVIEW_DIR = "$env:TEMP\bucket-mount-previews"
 cargo test --lib native_editor_manages_profiles_and_encrypts_credentials -- --ignored
 ```
 
-Pushing a tag (`v1.0.1`) runs the [Windows workflow](.github/workflows/windows.yml), which checks
+Pushing a tag (`v1.0.2`) runs the [Windows workflow](.github/workflows/windows.yml), which checks
 formatting, Clippy, and tests on both architectures, then publishes both setup executables and
 portable ZIPs with SHA256 checksums on a GitHub release. Both build jobs must succeed before
 publication.
+
+Versioned release notes live in [`docs/releases/`](docs/releases/v1.0.2.md). The publication job
+uses the matching notes file for the tag, falling back to generated notes when none is present.
 
 ## License
 

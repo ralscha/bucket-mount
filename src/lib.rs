@@ -13,5 +13,6 @@ pub mod platform;
 pub mod profiles;
 pub mod remote;
 pub mod state;
+pub mod sync_issue;
 #[cfg(windows)]
 pub mod tray;

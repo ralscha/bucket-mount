@@ -142,13 +142,14 @@ impl Manager {
             let task = std::thread::Builder::new()
                 .name(format!("bucket-{}", id))
                 .spawn(move || {
-                    struct Finished(Arc<AtomicBool>);
+                    struct Finished(Arc<AtomicBool>, Arc<Control>);
                     impl Drop for Finished {
                         fn drop(&mut self) {
                             self.0.store(true, Ordering::Release);
+                            self.1.retry_available.store(false, Ordering::Release);
                         }
                     }
-                    let _finished = Finished(worker_finished);
+                    let _finished = Finished(worker_finished, worker_control.clone());
                     let span = tracing::info_span!("connection", id = %config.device_id);
                     let _span = span.enter();
                     if let Some(previous) = previous {
@@ -168,7 +169,12 @@ impl Manager {
                         validation.map_err(anyhow::Error::msg)?;
                         let _enter = runtime.enter();
                         let remote = Arc::new(S3Remote::new(&config)?);
+                        worker_control.retry_available.store(true, Ordering::Release);
                         loop {
+                            while worker_control.paused.load(Ordering::Acquire)
+                                && !worker_control.stopping.load(Ordering::Acquire) {
+                                std::thread::sleep(Duration::from_millis(200));
+                            }
                             if worker_control.stopping.load(Ordering::Acquire) {
                                 return Ok(());
                             }
@@ -186,6 +192,9 @@ impl Manager {
                             for _ in 0..50 {
                                 if worker_control.stopping.load(Ordering::Acquire) {
                                     return Ok(());
+                                }
+                                if worker_control.sync_requested.swap(false, Ordering::AcqRel) {
+                                    break;
                                 }
                                 std::thread::sleep(Duration::from_millis(200));
                             }

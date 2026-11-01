@@ -6,7 +6,8 @@
 //! oplock. An open editor makes those operations fail for a later retry.
 
 use crate::namespace::{Namespace, OperationGuard};
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use crate::sync_issue::{FileOperation, WindowsFailure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -1149,7 +1150,7 @@ fn attribute_handle(path: &Path) -> Result<File> {
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
-        .with_context(|| format!("inspect {}", path.display()))
+        .map_err(|error| FileOperation::wrap(path, "Inspect file or folder", error.into()))
 }
 
 fn inspect_handle(handle: HANDLE) -> Result<(FileState, Option<Vec<u64>>)> {
@@ -1217,6 +1218,7 @@ struct ExclusiveFile {
 
 impl ExclusiveFile {
     fn open(path: &Path, delete: bool) -> Result<Self> {
+        let local_path = path;
         let path = wide_path(path)?;
         let mut protected = null_mut();
         check(
@@ -1234,7 +1236,8 @@ impl ExclusiveFile {
                 )
             },
             "lock cloud file (an application may still be using it)",
-        )?;
+        )
+        .map_err(|e| FileOperation::wrap(local_path, "Lock file or folder", e))?;
         if !unsafe { CfReferenceProtectedHandle(protected) } {
             unsafe { CfCloseHandle(protected) };
             bail!("file lock was interrupted; retry later");
@@ -1418,7 +1421,11 @@ fn wide_path(path: &Path) -> Result<Vec<u16>> {
 
 fn check(hr: i32, action: &str) -> Result<()> {
     if hr < 0 {
-        Err(anyhow!("{action}: HRESULT 0x{:08X}", hr as u32))
+        Err(WindowsFailure {
+            action: action.into(),
+            code: hr as u32,
+        }
+        .into())
     } else {
         Ok(())
     }
